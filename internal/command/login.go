@@ -34,6 +34,8 @@ func CmdLogin() cli.Command {
 
 	常规登录:
 		按提示一步一步来即可.
+		若账号开启了扫码安全验证, APP密码登录会失败, 此时会引导你使用
+		手机天翼云盘App扫码登录.
 `,
 		Category: "天翼云盘账号",
 		Before:   cmder.ReloadConfigFunc, // 每次进行登录动作的时候需要调用刷新配置
@@ -56,7 +58,14 @@ func CmdLogin() cli.Command {
 				cli.ShowCommandHelp(c, c.Command.Name)
 				return nil
 			}
-			cloudUser, _ := config.SetupUserByCookie(&webToken, &appToken)
+			cloudUser, apiErr := config.SetupUserByCookie(&webToken, &appToken)
+			if apiErr != nil || cloudUser == nil {
+				fmt.Println("登录失败: 无法获取用户信息, 请重新登录")
+				if apiErr != nil {
+					fmt.Println(apiErr)
+				}
+				return apiErr
+			}
 			// save username / password
 			cloudUser.LoginUserName = config.EncryptString(username)
 			cloudUser.LoginUserPassword = config.EncryptString(passowrd)
@@ -129,5 +138,6 @@ func CmdLogout() cli.Command {
 }
 
 func RunLogin(username, password string) (usernameStr, passwordStr string, webToken cloudpan.WebLoginToken, appToken cloudpan.AppLoginToken, error error) {
-	return cmder.DoLoginHelper(username, password)
+	// 交互式登录: 账号开启扫码验证导致 APP 密码登录失败时, 自动引导扫码登录
+	return cmder.DoLoginHelperWithQrCode(username, password)
 }

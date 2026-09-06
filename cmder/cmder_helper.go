@@ -44,6 +44,16 @@ func App() *cli.App {
 }
 
 func DoLoginHelper(username, password string) (usernameStr, passwordStr string, webToken cloudpan.WebLoginToken, appToken cloudpan.AppLoginToken, error error) {
+	return doLoginHelper(username, password, false)
+}
+
+// DoLoginHelperWithQrCode 交互式登录。
+// 账号密码(APP)登录失败时(常见于账号开启了扫码安全验证), 引导用户改用扫码登录。
+func DoLoginHelperWithQrCode(username, password string) (usernameStr, passwordStr string, webToken cloudpan.WebLoginToken, appToken cloudpan.AppLoginToken, error error) {
+	return doLoginHelper(username, password, true)
+}
+
+func doLoginHelper(username, password string, allowQrCode bool) (usernameStr, passwordStr string, webToken cloudpan.WebLoginToken, appToken cloudpan.AppLoginToken, error error) {
 	line := cmdliner.NewLiner()
 	defer line.Close()
 
@@ -67,6 +77,19 @@ func DoLoginHelper(username, password string) (usernameStr, passwordStr string, 
 	atoken, apperr := cloudpan.AppLogin(username, password)
 	if apperr != nil {
 		fmt.Println("APP登录失败：", apperr)
+		if allowQrCode {
+			// 账号可能开启了扫码安全验证, 引导用户使用扫码登录
+			fmt.Println("账号可能需要扫码安全验证, 是否改用扫码登录? (y/n)")
+			confirm, err2 := line.State.Prompt("> ")
+			if err2 == nil && (confirm == "y" || confirm == "Y") {
+				u, wt, at, qrErr := QrCodeLogin()
+				if qrErr == nil {
+					usernameStr, passwordStr, webToken, appToken = u, "", wt, at
+					return
+				}
+				fmt.Println("扫码登录失败：", qrErr)
+			}
+		}
 		return "", "", webToken, appToken, fmt.Errorf("登录失败")
 	}
 
