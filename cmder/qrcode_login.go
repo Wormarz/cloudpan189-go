@@ -27,6 +27,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -216,15 +217,23 @@ func QrCodeLogin() (username string, webToken cloudpan.WebLoginToken, appToken c
 		return "", webToken, appToken, err
 	}
 
-	// 3. 下载二维码图片到本地临时目录, 供用户扫码
+	// 3. 下载二维码图片到本地临时目录, 优先在终端直接显示二维码, 供用户扫码
 	savePath, err := saveQrLoginImage(client, uuidResp.EncodeUuid, loginForm.reqId)
 	if err != nil {
 		fmt.Printf("保存二维码图片失败: %s\n", err)
 		return "", webToken, appToken, err
 	}
 	fmt.Printf("请在手机上打开天翼云盘App, 使用\"扫码登录\"扫描以下二维码完成登录:\n")
-	fmt.Printf("打开以下路径, 以查看二维码\n%s\n\n", savePath)
-	fmt.Printf("若无法查看图片, 也可直接访问以下链接后扫码:\n%s\n\n", uuidResp.Uuid)
+	// Windows 的 cmd 控制台(GBK 代码页)无法显示 ▀/▄/█ 半块字符, 保留打开图片文件的旧方式
+	if runtime.GOOS != "windows" && renderQrLoginImage(savePath) == nil {
+		// 终端已直接打印二维码; 图片文件保留作为备用
+		fmt.Printf("如二维码显示异常, 可打开以下图片扫码:\n%s\n\n", savePath)
+	} else {
+		// 终端渲染失败(如图片格式异常/无法识别)或为 Windows, 回退为提示打开图片文件
+		logger.Verboseln("render qr login image to terminal: failed, fallback to image file")
+		fmt.Printf("打开以下路径, 以查看二维码\n%s\n\n", savePath)
+	}
+	fmt.Printf("若仍无法扫码, 可直接访问以下链接查看二维码:\n%s\n\n", uuidResp.Uuid)
 
 	// 4. 轮询二维码状态
 	si, err := pollQrLoginState(client, loginForm, uuidResp)
