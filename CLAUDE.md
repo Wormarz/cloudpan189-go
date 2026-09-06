@@ -3,6 +3,11 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 > 注意：本项目 README 声明已不再维护。所有命令帮助、注释、错误提示均为中文，修改代码时保持这一风格。
+>
+> 维护方式：本仓库是 fork 出来的分支，独立维护（`Wormarz/cloudpan189-go`），不再向上游合并。
+> 项目细节、进度记录、后续计划统一在 Notion 上维护和跟踪（页面「cloudpan189-go」：
+> https://app.notion.com/p/3d224b48f55980938c90d8ea7c996e5f ），
+> **不要在仓库内的文件（docs/ 等）里记录项目进度**。需要查阅或更新项目进度时，用 notion MCP 访问该页面。
 
 ## 构建与测试
 
