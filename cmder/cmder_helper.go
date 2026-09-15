@@ -1,6 +1,7 @@
 package cmder
 
 import (
+	"errors"
 	"fmt"
 	"github.com/tickstep/cloudpan189-api/cloudpan"
 	"github.com/tickstep/cloudpan189-api/cloudpan/apierror"
@@ -82,6 +83,11 @@ func doLoginHelper(username, password string) (usernameStr, passwordStr string, 
 			if qrErr == nil {
 				usernameStr, passwordStr, webToken, appToken = u, "", wt, at
 				return
+			}
+			if errors.Is(qrErr, errQrLoginCancelled) {
+				// 用户按 Ctrl C 主动取消本次扫码, 不算登录失败
+				fmt.Println("已取消扫码登录")
+				return "", "", webToken, appToken, qrErr
 			}
 			fmt.Println("扫码登录失败：", qrErr)
 		}

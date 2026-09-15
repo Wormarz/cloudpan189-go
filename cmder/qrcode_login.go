@@ -25,6 +25,7 @@ import (
 	"net/http/cookiejar"
 	"net/url"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"runtime"
@@ -32,6 +33,12 @@ import (
 	"strings"
 	"time"
 )
+
+// errQrLoginCancelled 用户主动取消扫码登录(Ctrl C)
+var errQrLoginCancelled = errors.New("扫码登录已取消")
+
+// errQrLoginExpired 二维码过期或等待超时, 可重新生成二维码后再扫
+var errQrLoginExpired = errors.New("二维码已过期或等待超时")
 
 // 扫码登录(扫码认证)状态码, 来自 open.e.189.cn 统一登录框前端逻辑
 const (
@@ -61,10 +68,12 @@ const (
 	qrLoginChannelId  = "web_cloud.189.cn"
 )
 
-// 扫码轮询间隔与超时时间
+// 扫码轮询间隔、超时时间与二维码最大生成次数
 const (
 	qrLoginPollInterval = 3 * time.Second
 	qrLoginPollTimeout  = 3 * time.Minute
+	// qrLoginMaxAttempts 二维码最多生成次数, 过期/超时后自动重新生成一次
+	qrLoginMaxAttempts = 2
 	qrLoginUserAgent    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
 
@@ -200,6 +209,7 @@ func (qc *qrHttpClient) setCookies(host string, cookies []*http.Cookie) {
 // 账号开启扫码验证后, APP 密码登录 (unifyLoginForPC.action) 会失败/超时,
 // 此时可改用此方式: 与服务端生成二维码, 用户使用天翼云盘 App 扫码并确认后,
 // 再换取 APP 会话 (sessionKey) 与 WEB 会话 (COOKIE_LOGIN_USER)。
+// 等待扫码时支持 Ctrl C 主动取消; 二维码过期或等待超时时自动重新生成一次二维码。
 func QrCodeLogin() (username string, webToken cloudpan.WebLoginToken, appToken cloudpan.AppLoginToken, err error) {
 	client := newQrHttpClient()
 
@@ -210,18 +220,40 @@ func QrCodeLogin() (username string, webToken cloudpan.WebLoginToken, appToken c
 		return "", webToken, appToken, err
 	}
 
+	// 2~4. 生成并显示二维码 + 轮询扫码状态; 过期/超时自动重新生成再试
+	for attempt := 1; attempt <= qrLoginMaxAttempts; attempt++ {
+		if attempt > 1 {
+			fmt.Printf("二维码已过期或等待超时, 正在重新生成二维码(%d/%d), 请重新扫码...\n", attempt, qrLoginMaxAttempts)
+		}
+		si, pollErr := qrCodeLoginAttempt(client, loginForm)
+		if pollErr == nil {
+			return qrCodeLoginFinish(client, si, loginForm)
+		}
+		if errors.Is(pollErr, errQrLoginCancelled) {
+			return "", webToken, appToken, pollErr
+		}
+		if errors.Is(pollErr, errQrLoginExpired) && attempt < qrLoginMaxAttempts {
+			continue
+		}
+		return "", webToken, appToken, pollErr
+	}
+	return "", webToken, appToken, errQrLoginExpired
+}
+
+// qrCodeLoginAttempt 生成二维码并显示, 轮询扫码状态直至成功/取消/超时。
+func qrCodeLoginAttempt(client *qrHttpClient, lc *qrLoginFormCache) (*qrLoginStateResp, error) {
 	// 2. 生成二维码
-	uuidResp, err := getQrCodeUuid(client, loginForm)
+	uuidResp, err := getQrCodeUuid(client, lc)
 	if err != nil {
 		fmt.Printf("获取二维码失败: %s\n", err)
-		return "", webToken, appToken, err
+		return nil, err
 	}
 
 	// 3. 下载二维码图片到本地临时目录, 优先在终端直接显示二维码, 供用户扫码
-	savePath, err := saveQrLoginImage(client, uuidResp.EncodeUuid, loginForm.reqId)
+	savePath, err := saveQrLoginImage(client, uuidResp.EncodeUuid, lc.reqId)
 	if err != nil {
 		fmt.Printf("保存二维码图片失败: %s\n", err)
-		return "", webToken, appToken, err
+		return nil, err
 	}
 	fmt.Printf("请在手机上打开天翼云盘App, 使用\"扫码登录\"扫描以下二维码完成登录:\n")
 	// Windows 的 cmd 控制台(GBK 代码页)无法显示 ▀/▄/█ 半块字符, 保留打开图片文件的旧方式
@@ -236,10 +268,11 @@ func QrCodeLogin() (username string, webToken cloudpan.WebLoginToken, appToken c
 	fmt.Printf("若仍无法扫码, 可直接访问以下链接查看二维码:\n%s\n\n", uuidResp.Uuid)
 
 	// 4. 轮询二维码状态
-	si, err := pollQrLoginState(client, loginForm, uuidResp)
-	if err != nil {
-		return "", webToken, appToken, err
-	}
+	return pollQrLoginState(client, lc, uuidResp)
+}
+
+// qrCodeLoginFinish 扫码成功后换取 APP 会话 (sessionKey/sessionSecret) 与 WEB 会话 (COOKIE_LOGIN_USER)。
+func qrCodeLoginFinish(client *qrHttpClient, si *qrLoginStateResp, lc *qrLoginFormCache) (username string, webToken cloudpan.WebLoginToken, appToken cloudpan.AppLoginToken, err error) {
 	logger.Verboseln("qr login success redirectUrl: " + si.RedirectUrl)
 
 	// 5. WEB 会话 cookie 可能由轮询成功响应直接下发, 先查一次 jar
@@ -274,7 +307,7 @@ func QrCodeLogin() (username string, webToken cloudpan.WebLoginToken, appToken c
 	if webToken.CookieLoginUser == "" {
 		logger.Verboseln("try to follow redirectUrl: " + si.RedirectUrl)
 		redirectHeader := map[string]string{
-			"lt":      loginForm.lt,
+			"lt":      lc.lt,
 			"Referer": qrLoginOauth2Host,
 		}
 		client.setRedirectHeader(redirectHeader)
@@ -295,7 +328,7 @@ func QrCodeLogin() (username string, webToken cloudpan.WebLoginToken, appToken c
 	if webToken.CookieLoginUser == "" {
 		return "", webToken, appToken, errors.New("获取WEB会话(COOKIE_LOGIN_USER)失败, 请重新登录再试")
 	}
-	return
+	return username, webToken, appToken, nil
 }
 
 // qrWebSessionCookie 通过携带 sessionKey 调用 cloud.189.cn 的 web 接口,
@@ -425,30 +458,82 @@ func saveQrLoginImage(client *qrHttpClient, encodeUuid, reqId string) (string, e
 	return savePath, nil
 }
 
-// pollQrLoginState 轮询二维码扫码状态, 直至登录成功或失败
+// pollQrLoginState 轮询二维码扫码状态, 直至登录成功或失败。
+// 等待期间把 Ctrl C 变成"取消本次扫码"(不再直接退出程序);
+// 超时或二维码过期返回 errQrLoginExpired, 由上层决定是否重新生成二维码。
+// 返回 errQrLoginCancelled 表示用户主动取消。
 func pollQrLoginState(client *qrHttpClient, lc *qrLoginFormCache, uuidResp *qrUuidResp) (*qrLoginStateResp, error) {
 	var (
 		deadline      = time.Now().Add(qrLoginPollTimeout)
 		lastStatus    = qrLoginStatusWaiting
 		scannedPrompt = false
+		// termOutput 输出到终端时才显示行内倒计时等交互; 重定向/日志场景保持简洁
+		termOutput = stdoutIsTerminal()
 	)
+
+	// 轮询期间捕获 Ctrl C 作为取消信号, 而不是让整个进程退出
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+
+	// checkQrLoginState 网络错误最大连续次数, 网络抖动不打断这次扫码
+	const maxNetErrCount = 5
+	netErrCount := 0
+
+	// showStatus 在终端上刷新一行等待状态(原地更新, 不清掉二维码)
+	showStatus := func() {
+		if !termOutput {
+			return
+		}
+		remaining := int(time.Until(deadline).Seconds())
+		if remaining < 0 {
+			remaining = 0
+		}
+		st := "等待扫码中"
+		if scannedPrompt {
+			st = "已扫码, 等待手机确认"
+		}
+		fmt.Printf("\r[扫码登录] %s, 剩余 %d 秒, 按 Ctrl C 取消   ", st, remaining)
+	}
+
+	// 结束轮询时把最后一行 \r 提示换行收尾, 避免和后续输出挤在同一行
+	defer func() {
+		if termOutput {
+			fmt.Println()
+		}
+	}()
+
 	for time.Now().Before(deadline) {
+		showStatus()
+
 		si, err := checkQrLoginState(client, lc, uuidResp)
 		if err != nil {
-			return nil, err
+			// 网络抖动: 记录并继续, 连续失败过多才放弃本次扫码
+			netErrCount++
+			logger.Verboseln("qrcodeLoginState.do error: " + err.Error())
+			if netErrCount >= maxNetErrCount {
+				return nil, err
+			}
+			time.Sleep(qrLoginPollInterval)
+			continue
 		}
+		netErrCount = 0
+
 		switch si.Status {
 		case qrLoginStatusSuccess:
 			logger.Verboseln("qr login success")
+			showStatus()
 			return si, nil
 		case qrLoginStatusExpired:
-			return nil, errors.New("二维码已过期, 请重新登录再试")
+			return nil, errQrLoginExpired
 		case qrLoginStatusSecondVerify:
 			return nil, errors.New("账号需要二次验证, 请改用账号密码登录方式重试")
 		case qrLoginStatusScanned:
 			if !scannedPrompt {
-				fmt.Println("已扫码, 请在手机上确认登录...")
 				scannedPrompt = true
+				if !termOutput {
+					fmt.Println("已扫码, 请在手机上确认登录...")
+				}
 			}
 		case qrLoginStatusWaiting:
 			// 等待扫码中
@@ -459,9 +544,23 @@ func pollQrLoginState(client *qrHttpClient, lc *qrLoginFormCache, uuidResp *qrUu
 			logger.Verboseln("qr login status: ", si.Status)
 			lastStatus = si.Status
 		}
-		time.Sleep(qrLoginPollInterval)
+
+		select {
+		case <-sigCh:
+			return nil, errQrLoginCancelled
+		case <-time.After(qrLoginPollInterval):
+		}
 	}
-	return nil, errors.New("扫码登录超时, 请重试")
+	return nil, errQrLoginExpired
+}
+
+// stdoutIsTerminal 判断标准输出是否连接到终端
+func stdoutIsTerminal() bool {
+	info, err := os.Stdout.Stat()
+	if err != nil {
+		return false
+	}
+	return info.Mode()&os.ModeCharDevice != 0
 }
 
 func checkQrLoginState(client *qrHttpClient, lc *qrLoginFormCache, uuidResp *qrUuidResp) (*qrLoginStateResp, error) {
