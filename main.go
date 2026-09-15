@@ -71,9 +71,11 @@ func init() {
 
 func checkLoginExpiredAndRelogin() {
 	cmder.ReloadConfigFunc(nil)
+	// ActiveUser() 内部会用已保存的会话(token)校验并恢复登录状态:
+	// 会话仍有效时直接返回已恢复的用户, 此时不需要重新登录;
+	// 会话过期/未登录时返回 nil, 此时才需要走自动登录(密码失败会引导扫码登录)。
 	activeUser := config.Config.ActiveUser()
-	if activeUser == nil || activeUser.UID != 0 {
-		// maybe expired, try to login
+	if activeUser == nil || activeUser.UID == 0 {
 		cmder.TryLogin()
 	}
 	cmder.SaveConfigFunc(nil)
@@ -309,13 +311,17 @@ func main() {
 			}
 		}()
 
+		// 未登录时只在 REPL 首轮尝试一次自动登录(密码失败会引导扫码登录),
+		// 避免每条命令都重复弹出登录提示; 之后可随时用 login 命令手动登录。
+		autoLoginTried := false
 		for {
 			var (
 				prompt     string
 				activeUser = config.Config.ActiveUser()
 			)
 
-			if activeUser == nil {
+			if activeUser == nil && !autoLoginTried {
+				autoLoginTried = true
 				activeUser = cmder.TryLogin()
 			}
 
