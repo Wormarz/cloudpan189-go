@@ -4,7 +4,7 @@
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
 //
-//     http://www.apache.org/licenses/LICENSE-2.0
+//	http://www.apache.org/licenses/LICENSE-2.0
 //
 // Unless required by applicable law or agreed to in writing, software
 // distributed under the License is distributed on an "AS IS" BASIS,
@@ -47,7 +47,9 @@ type (
 		FolderCreateMutex *sync.Mutex
 		FolderSyncDb      SyncDb //文件备份状态数据库
 
-		PanClient         *cloudpan.PanClient
+		PanClient *cloudpan.PanClient
+		// AppToken APP会话信息, 大文件分片上传(upload.cloud.189.cn)签名需要
+		AppToken          cloudpan.AppLoginToken
 		UploadingDatabase *UploadingDatabase // 数据库
 		Parallel          int
 		NoRapidUpload     bool // 禁用秒传
@@ -113,7 +115,13 @@ func (utu *UploadTaskUnit) prepareFile() {
 			}
 		} else {
 			// 需要修正上一次上传值，断点续传
-			utu.state.BlockList[0].Range.Begin = appGetUploadFileStatusResult.Size
+			// 注意: 首次尝试创建了上传任务但未落库(state为nil)时也要能走到这一步,
+			// 这里用 state.Range 仅用于 PC 整文件上传的续传, 空 state 跳过即可
+			if utu.state != nil && len(utu.state.BlockList) > 0 {
+				if utu.state.BlockList[0] != nil {
+					utu.state.BlockList[0].Range.Begin = appGetUploadFileStatusResult.Size
+				}
+			}
 		}
 		return
 	}
@@ -173,6 +181,12 @@ func (utu *UploadTaskUnit) rapidUpload() (isContinue bool, result *taskframework
 // upload 上传文件
 func (utu *UploadTaskUnit) upload() (result *taskframework.TaskUnitRunResult) {
 	utu.Step = StepUploadUpload
+
+	// 天翼云盘数据上传接口(PC 端 createUploadFile 流程)对单次请求有恰好 200MiB 的上限,
+	// 超过该大小的文件改用 upload.cloud.189.cn 的分片上传接口
+	if utu.LocalFileChecksum.Length > maxSingleUploadSize {
+		return utu.webStreamUpload()
+	}
 
 	var blockSize int64
 	if utu.NoSplitFile {
