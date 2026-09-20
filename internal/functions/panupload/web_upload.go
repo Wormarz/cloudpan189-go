@@ -18,6 +18,7 @@ import (
 	"crypto/aes"
 	"crypto/hmac"
 	"crypto/md5"
+	"crypto/rsa"
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/hex"
@@ -32,7 +33,6 @@ import (
 	"time"
 
 	"github.com/tickstep/cloudpan189-api/cloudpan"
-	"github.com/tickstep/cloudpan189-api/cloudpan/apiutil"
 	"github.com/tickstep/cloudpan189-go/internal/taskframework"
 	"github.com/tickstep/library-go/converter"
 )
@@ -51,8 +51,7 @@ const (
 
 // webStreamUpload 大文件(>200MiB)通过 upload.cloud.189.cn 分片上传接口上传。
 // 流程: initMultiUpload -> 分片读取并逐个获取预签名URL上传 -> commitMultiUploadFile。
-// 实现的协议与社区(alist 189pc 驱动)一致: 业务参数经 AES-128-ECB 加密后作为 params
-// 查询参数并由 HMAC-SHA1 签名。
+// 使用官网网页上传协议：Cookie 获取网页会话、公钥；临时密钥加密并签名，RSA 包装密钥。
 func (utu *UploadTaskUnit) webStreamUpload() (result *taskframework.TaskUnitRunResult) {
 	result = &taskframework.TaskUnitRunResult{}
 	fileSize := utu.LocalFileChecksum.Length
@@ -87,7 +86,7 @@ func (utu *UploadTaskUnit) webStreamUpload() (result *taskframework.TaskUnitRunR
 		lastSize = sliceSize
 	}
 
-	uploader := newWebUploader(utu.AppToken, utu.FamilyId)
+	uploader := newWebUploader(utu.WebToken)
 	pathPrefix := "/person"
 	params := map[string]string{
 		"parentFolderId": utu.LocalFileChecksum.ParentFolderId,
@@ -133,7 +132,7 @@ func (utu *UploadTaskUnit) webStreamUpload() (result *taskframework.TaskUnitRunR
 		if i == count {
 			slice = slice[:lastSize]
 		}
-		if _, err := io.ReadFull(file, slice); err != nil && err != io.EOF {
+		if _, err := io.ReadFull(file, slice); err != nil {
 			result.Err = err
 			result.ResultMessage = "读取本地文件分片失败"
 			result.NeedRetry = true
@@ -208,6 +207,11 @@ func (utu *UploadTaskUnit) webStreamUpload() (result *taskframework.TaskUnitRunR
 		result.NeedRetry = true
 		return
 	}
+	if commitResp.File.UserFileID == "" {
+		result.Err = errors.New("提交分片上传失败: 未返回文件ID")
+		result.ResultMessage = result.Err.Error()
+		return
+	}
 	cmdUploadVerbose.Infof("commitMultiUploadFile ok fileId=%s", commitResp.File.UserFileID)
 
 	// 成功: 统计 + 数据库清理 + 打印结果
@@ -239,59 +243,29 @@ func webPartSize(fileSize int64) int64 {
 
 // webUploader upload.cloud.189.cn 分片上传客户端
 type webUploader struct {
-	client        *http.Client
-	sessionKey    string
-	sessionSecret string
-	familyId      int64
+	client          *http.Client
+	sessionKey      string
+	cookieLoginUser string
+	publicKey       *rsa.PublicKey
+	pkID            string
 }
 
-func newWebUploader(appToken cloudpan.AppLoginToken, familyId int64) *webUploader {
-	sessionKey, sessionSecret := appToken.SessionKey, appToken.SessionSecret
-	if familyId > 0 {
-		sessionKey, sessionSecret = appToken.FamilySessionKey, appToken.FamilySessionSecret
-	}
+func newWebUploader(webToken cloudpan.WebLoginToken) *webUploader {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ForceAttemptHTTP2 = true
 	tr.ResponseHeaderTimeout = 60 * time.Second
-	return &webUploader{
-		client: &http.Client{
-			Transport: tr,
-			// 不设总超时, 上传分片在慢速网络下也需要足够时间
-		},
-		sessionKey:    sessionKey,
-		sessionSecret: sessionSecret,
-		familyId:      familyId,
-	}
+	return &webUploader{client: &http.Client{Transport: tr}, cookieLoginUser: webToken.CookieLoginUser}
 }
 
 // webRequest 请求 upload.cloud.189.cn 接口(GET)。
-// 业务参数加密成 params 查询参数并参与 HMAC 签名, 与官方 web 上传客户端一致。
+// 业务参数用临时密钥加密成 params，密钥由 RSA 包装，使用官网网页上传认证。
 func (w *webUploader) webRequest(path string, params map[string]string, result interface{}) error {
-	baseUrl := webUploadBaseUrl + path
-	paramsStr := webJoinParams(params)
-	encParams := ""
-	if paramsStr != "" {
-		ep, err := aesEcbEncrypt(paramsStr, w.sessionSecret[:16])
-		if err != nil {
-			return err
-		}
-		encParams = ep
-	}
-	dateOfGmt := apiutil.DateOfGmtStr()
-	fullUrl := baseUrl + "?" + apiutil.PcClientInfoSuffixParam()
-	if encParams != "" {
-		fullUrl += "&params=" + encParams
-	}
-	req, err := http.NewRequest(http.MethodGet, fullUrl, nil)
+	req, err := w.newWebRequest(path, params)
 	if err != nil {
 		return err
 	}
-	req.Header.Set("Date", dateOfGmt)
-	req.Header.Set("SessionKey", w.sessionKey)
-	req.Header.Set("X-Request-ID", apiutil.XRequestId())
-	req.Header.Set("Signature", webHmacSign(w.sessionSecret, w.sessionKey, http.MethodGet, baseUrl, dateOfGmt, encParams))
 
-	cmdUploadVerbose.Infof("web upload request: %s?%s", path, strings.Join(sortMapKeysToStrings(params), "&"))
+	cmdUploadVerbose.Infof("web upload request: %s", path)
 	resp, err := w.client.Do(req)
 	if err != nil {
 		return err
@@ -301,15 +275,15 @@ func (w *webUploader) webRequest(path string, params map[string]string, result i
 	if err != nil {
 		return err
 	}
-	cmdUploadVerbose.Infof("web upload request %s resp: %s", path, webTruncate(string(body), 300))
+	cmdUploadVerbose.Infof("web upload response: %s HTTP %d", path, resp.StatusCode)
 
 	// 服务端错误(JSON/XML 混合结构)
 	var perr webRespErr
 	if err := json.Unmarshal(body, &perr); err == nil && perr.hasError() {
-		return perr.toError()
+		return fmt.Errorf("HTTP %d: %w", resp.StatusCode, perr.toError())
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, webTruncate(string(body), 200))
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 	if result != nil {
 		if err := json.Unmarshal(body, result); err != nil {
@@ -330,7 +304,7 @@ func (w *webUploader) putSlice(reqUrl, reqHeader string, data []byte) error {
 	for k, v := range webParseHttpHeader(reqHeader) {
 		req.Header.Set(k, v)
 	}
-	cmdUploadVerbose.Infof("upload slice: %s headers=%s size=%d", reqUrl, webTruncate(reqHeader, 200), len(data))
+	cmdUploadVerbose.Infof("upload slice: size=%d", len(data))
 	resp, err := w.client.Do(req)
 	if err != nil {
 		return err
@@ -342,10 +316,10 @@ func (w *webUploader) putSlice(reqUrl, reqHeader string, data []byte) error {
 	}
 	var perr webRespErr
 	if err := json.Unmarshal(body, &perr); err == nil && perr.hasError() {
-		return perr.toError()
+		return fmt.Errorf("HTTP %d: %w", resp.StatusCode, perr.toError())
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, webTruncate(string(body), 200))
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
 	return nil
 }
@@ -413,18 +387,6 @@ func webJoinParams(params map[string]string) string {
 	return b.String()
 }
 
-func sortMapKeysToStrings(m map[string]string) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	for i, k := range keys {
-		keys[i] = k + "=" + m[k]
-	}
-	return keys
-}
-
 // webParseHttpHeader 解析预签名请求头字符串 (k=v&k=v 格式)
 func webParseHttpHeader(str string) map[string]string {
 	h := map[string]string{}
@@ -444,15 +406,20 @@ type webRespErr struct {
 	Message    string `json:"message"`
 	ErrorCode  string `json:"errorCode"`
 	ErrorMsg   string `json:"errorMsg"`
+	Msg        string `json:"msg"`
 	Error_     string `json:"error"`
 }
 
 func (e webRespErr) hasError() bool {
 	switch v := e.ResCode.(type) {
 	case float64:
-		return v != 0
+		if v != 0 {
+			return true
+		}
 	case string:
-		return e.ResCode != ""
+		if v != "" && v != "0" {
+			return true
+		}
 	}
 	return (e.Code != "" && e.Code != "SUCCESS") || e.ErrorCode != "" || e.Error_ != ""
 }
@@ -460,10 +427,30 @@ func (e webRespErr) hasError() bool {
 func (e webRespErr) toError() error {
 	msg := e.ResMessage
 	if msg == "" {
+		msg = e.Msg
+	}
+	if msg == "" {
 		msg = e.Message
 	}
 	if msg == "" {
 		msg = e.ErrorMsg
+	}
+	if msg == "" {
+		msg = e.Error_
+	}
+	code := e.Code
+	if e.ErrorCode != "" {
+		code = e.ErrorCode
+	}
+	if e.ResCode != nil && fmt.Sprint(e.ResCode) != "" && fmt.Sprint(e.ResCode) != "0" {
+		code = fmt.Sprint(e.ResCode)
+	}
+	if code != "" && code != "SUCCESS" {
+		if msg == "" {
+			msg = code
+		} else if msg != code {
+			msg = code + ": " + msg
+		}
 	}
 	if msg == "" {
 		msg = e.ErrorCode
@@ -475,13 +462,6 @@ func (e webRespErr) toError() error {
 		msg = "服务器返回错误"
 	}
 	return errors.New(msg)
-}
-
-func webTruncate(s string, n int) string {
-	if len(s) > n {
-		return s[:n] + "..."
-	}
-	return s
 }
 
 // webUploadUrl 单个分片的预签名上传信息

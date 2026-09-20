@@ -48,8 +48,8 @@ type (
 		FolderSyncDb      SyncDb //文件备份状态数据库
 
 		PanClient *cloudpan.PanClient
-		// AppToken APP会话信息, 大文件分片上传(upload.cloud.189.cn)签名需要
-		AppToken          cloudpan.AppLoginToken
+		// WebToken 网页会话信息，大文件分片上传使用官网网页认证。
+		WebToken          cloudpan.WebLoginToken
 		UploadingDatabase *UploadingDatabase // 数据库
 		Parallel          int
 		NoRapidUpload     bool // 禁用秒传
@@ -94,6 +94,12 @@ func (utu *UploadTaskUnit) prepareFile() {
 	)
 	utu.panDir = path.Clean(panDir)
 	utu.panFile = panFile
+
+	// 分片上传不使用 PC 上传任务及其续传状态，重新确认目标目录即可。
+	if utu.LocalFileChecksum.Length > maxSingleUploadSize {
+		utu.Step = StepUploadPrepareUpload
+		return
+	}
 
 	// 检测断点续传
 	utu.state = utu.UploadingDatabase.Search(&utu.LocalFileChecksum.LocalFileMeta)
@@ -405,6 +411,13 @@ StepUploadPrepareUpload:
 	}
 	time.Sleep(time.Duration(2) * time.Second)
 	utu.FolderCreateMutex.Unlock()
+
+	// 大文件直接初始化分片任务，避免先创建一个不会提交的 PC 上传任务。
+	// 覆盖由分片提交的 opertype 处理，不提前删除目标文件。
+	if utu.LocalFileChecksum.Length > maxSingleUploadSize {
+		utu.LocalFileChecksum.ParentFolderId = rs.FileId
+		return utu.upload()
+	}
 
 	if utu.IsOverwrite {
 		// 标记覆盖旧同名文件

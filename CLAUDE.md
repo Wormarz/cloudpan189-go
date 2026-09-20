@@ -30,7 +30,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 6. **`internal/functions/pandownload` / `panupload`** — 上传/下载的任务单元层，实现 `TaskUnit` 接口（`DownloadTaskUnit`、`UploadTaskUnit`）并调度底层传输引擎。
 7. **`internal/file/downloader/` / `uploader/`** — 底层 HTTP 分片传输引擎。
    - downloader：多线程 Range 分片写入 `io.WriterAt`，边写边算 MD5 校验（`internal/localfile`），断点续传用 `InstanceState` 持久化，进度监控 `monitor.go`。下载中的文件后缀 `.cloudpan189-downloading`。
-   - uploader：`MultiUpload` 接口 + 分块上传。**小文件（≤200MiB）走 PC 接口（`api.cloud.189.cn` 的 `createUploadFile` 流程）整文件 PUT**（`CmdUpload` 里 `Parallel=1, NoSplitFile=true`），该接口单请求上限恰好 200MiB（超出 413）；**>200MiB 自动改走 `internal/functions/panupload/web_upload.go` 的 web 分片上传**（`upload.cloud.189.cn`：initMultiUpload → getMultiUploadUrls 预签名分片 → commitMultiUploadFile，params 经 AES-128-ECB 加密 + HMAC-SHA1 签名）。上传中断现场存 `cloud189_uploading.json`。
+   - uploader：`MultiUpload` 接口 + 分块上传。**小文件（≤200MiB）走 PC 接口（`api.cloud.189.cn` 的 `createUploadFile` 流程）整文件 PUT**（`CmdUpload` 里 `Parallel=1, NoSplitFile=true`），该接口单请求上限恰好 200MiB（超出 413）；**>200MiB 自动改走 `internal/functions/panupload/web_upload.go` 的 web 分片上传**（`upload.cloud.189.cn`：initMultiUpload → getMultiUploadUrls 预签名分片 → commitMultiUploadFile，先用 Cookie 获取网页会话和 RSA 公钥，再用每请求临时密钥做 AES-128-ECB 加密 + HMAC-SHA1 签名，RSA 包装临时密钥；大文件不创建 PC 上传任务）。上传中断现场存 `cloud189_uploading.json`。
 8. **`internal/localfile/`** — 本地文件抽象，`checksum_write.go` 支持边写边算 md5/crc32（秒传与下载校验的基础）。
 9. **`internal/panupdate/`** — 通过 GitHub Releases API 检查/下载更新的自更新，v0.1.3 起默认不自动核验。
 10. **`library/`** — 仓库内通用小库：`crypto`（`tool enc/dec` 命令的文件加解密）、`homedir`、`requester/transfer`（下载 Range 列表、实例状态、状态结构）。
