@@ -50,7 +50,8 @@ type (
 		PanClient *cloudpan.PanClient
 		// WebToken 网页会话信息，大文件分片上传使用官网网页认证。
 		WebToken          cloudpan.WebLoginToken
-		UploadingDatabase *UploadingDatabase // 数据库
+		AppToken          cloudpan.AppLoginToken // 用于恢复上传会话，不修改持久化认证
+		UploadingDatabase *UploadingDatabase     // 数据库
 		Parallel          int
 		NoRapidUpload     bool // 禁用秒传
 		NoSplitFile       bool // 禁用分片上传

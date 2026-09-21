@@ -418,6 +418,7 @@ func RunUpload(localPaths []string, savePath string, opt *UploadOptions) {
 				FamilyId:          opt.FamilyId,
 				PanClient:         activeUser.PanClient(),
 				WebToken:          activeUser.WebToken,
+				AppToken:          activeUser.AppToken,
 				UploadingDatabase: uploadDatabase,
 				FolderCreateMutex: folderCreateMutex,
 				Parallel:          opt.Parallel,

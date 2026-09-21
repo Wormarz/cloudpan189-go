@@ -86,7 +86,7 @@ func (utu *UploadTaskUnit) webStreamUpload() (result *taskframework.TaskUnitRunR
 		lastSize = sliceSize
 	}
 
-	uploader := newWebUploader(utu.WebToken)
+	uploader := newWebUploader(utu.WebToken, utu.AppToken)
 	pathPrefix := "/person"
 	params := map[string]string{
 		"parentFolderId": utu.LocalFileChecksum.ParentFolderId,
@@ -246,20 +246,34 @@ type webUploader struct {
 	client          *http.Client
 	sessionKey      string
 	cookieLoginUser string
+	accessToken     string
 	publicKey       *rsa.PublicKey
 	pkID            string
 }
 
-func newWebUploader(webToken cloudpan.WebLoginToken) *webUploader {
+func newWebUploader(webToken cloudpan.WebLoginToken, appToken cloudpan.AppLoginToken) *webUploader {
 	tr := http.DefaultTransport.(*http.Transport).Clone()
 	tr.ForceAttemptHTTP2 = true
 	tr.ResponseHeaderTimeout = 60 * time.Second
-	return &webUploader{client: &http.Client{Transport: tr}, cookieLoginUser: webToken.CookieLoginUser}
+	return &webUploader{client: &http.Client{Transport: tr}, cookieLoginUser: webToken.CookieLoginUser, accessToken: appToken.AccessToken}
 }
 
 // webRequest 请求 upload.cloud.189.cn 接口(GET)。
 // 业务参数用临时密钥加密成 params，密钥由 RSA 包装，使用官网网页上传认证。
 func (w *webUploader) webRequest(path string, params map[string]string, result interface{}) error {
+	err := w.webRequestOnce(path, params, result)
+	var apierr *webHTTPError
+	if !strings.HasSuffix(path, "/initMultiUpload") || !errors.As(err, &apierr) || apierr.status != http.StatusInternalServerError {
+		return err
+	}
+	if refreshErr := w.refreshUploadSession(); refreshErr != nil {
+		return fmt.Errorf("%w；自动恢复上传会话失败: %v", err, refreshErr)
+	}
+	cmdUploadVerbose.Infof("已刷新上传会话，重试初始化")
+	return w.webRequestOnce(path, params, result)
+}
+
+func (w *webUploader) webRequestOnce(path string, params map[string]string, result interface{}) error {
 	req, err := w.newWebRequest(path, params)
 	if err != nil {
 		return err
@@ -280,10 +294,10 @@ func (w *webUploader) webRequest(path string, params map[string]string, result i
 	// 服务端错误(JSON/XML 混合结构)
 	var perr webRespErr
 	if err := json.Unmarshal(body, &perr); err == nil && perr.hasError() {
-		return fmt.Errorf("HTTP %d: %w", resp.StatusCode, perr.toError())
+		return &webHTTPError{resp.StatusCode, perr.toError()}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+		return &webHTTPError{resp.StatusCode, errors.New(http.StatusText(resp.StatusCode))}
 	}
 	if result != nil {
 		if err := json.Unmarshal(body, result); err != nil {
@@ -316,10 +330,10 @@ func (w *webUploader) putSlice(reqUrl, reqHeader string, data []byte) error {
 	}
 	var perr webRespErr
 	if err := json.Unmarshal(body, &perr); err == nil && perr.hasError() {
-		return fmt.Errorf("HTTP %d: %w", resp.StatusCode, perr.toError())
+		return &webHTTPError{resp.StatusCode, perr.toError()}
 	}
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, http.StatusText(resp.StatusCode))
+		return &webHTTPError{resp.StatusCode, errors.New(http.StatusText(resp.StatusCode))}
 	}
 	return nil
 }

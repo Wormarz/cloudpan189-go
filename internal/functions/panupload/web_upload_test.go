@@ -38,7 +38,7 @@ func TestWebUploadOfficialAuthAndSignature(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	w := newWebUploader(cloudpan.WebLoginToken{CookieLoginUser: "test-cookie"})
+	w := newWebUploader(cloudpan.WebLoginToken{CookieLoginUser: "test-cookie"}, cloudpan.AppLoginToken{})
 	calls := 0
 	w.client.Transport = uploadTestTransport(func(r *http.Request) (*http.Response, error) {
 		calls++
@@ -139,7 +139,7 @@ func TestWebUploadErrorResponses(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			w := &webUploader{publicKey: &key.PublicKey, pkID: "test", sessionKey: "test", client: &http.Client{Transport: uploadTestTransport(func(*http.Request) (*http.Response, error) { return uploadTestResponse(tc.status, tc.body), nil })}}
-			err := w.webRequest("/person/initMultiUpload", map[string]string{"fileName": "test"}, nil)
+			err := w.webRequestOnce("/person/initMultiUpload", map[string]string{"fileName": "test"}, nil)
 			if tc.want == "" {
 				if err != nil {
 					t.Fatal(err)
@@ -152,7 +152,7 @@ func TestWebUploadErrorResponses(t *testing.T) {
 }
 
 func TestWebUploadRequiresCookie(t *testing.T) {
-	w := newWebUploader(cloudpan.WebLoginToken{})
+	w := newWebUploader(cloudpan.WebLoginToken{}, cloudpan.AppLoginToken{})
 	if _, err := w.newWebRequest("/person/initMultiUpload", nil); err == nil {
 		t.Fatal("缺少 Cookie 应返回错误")
 	}
